@@ -47,11 +47,13 @@ def _bench_mlx_residual_rmsnorm(*, rows: int, hidden: int, warmup: int, iters: i
     def mlx_op(a: object, b: object, w: object) -> object:
         z = a + b
         inv_rms = mx.rsqrt(mx.mean(z * z, axis=-1, keepdims=True) + DEFAULT_EPS)
-        return (z * inv_rms) * w
+        out = (z * inv_rms) * w
+        # MLX is lazy; force compute in the timed loop.
+        mx.eval(out)
+        return out
 
-    def mlx_sync(x: object | None) -> None:
-        if x is not None:
-            mx.eval(x)
+    def mlx_sync(_: object | None) -> None:
+        mx.synchronize()
 
     return benchmark_seconds(mlx_op, x, residual, weight, warmup=warmup, iters=iters, synchronize=mlx_sync)
 

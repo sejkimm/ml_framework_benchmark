@@ -114,6 +114,8 @@ def print_notes() -> None:
     print("Notes:")
     print(" - The first run includes compile/JIT cost, so warmup is required.")
     print(" - Some frameworks enqueue work asynchronously; timings include a sync after each timed loop.")
+    print(" - MLX is lazy; benchmarks force mx.eval per iteration and sync at the end to avoid dispatch-only timing.")
+    print(" - Sanity check: compare implied TFLOPs; unrealistic values usually mean timing is wrong.")
 
 
 def main(argv: list[str] | None = None) -> None:

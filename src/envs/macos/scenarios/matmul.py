@@ -36,11 +36,16 @@ def _bench_mlx_matmul(*, M: int, N: int, K: int, warmup: int, iters: int, seed: 
     a = mx.random.normal((M, K)).astype(mx.float16)
     b = mx.random.normal((K, N)).astype(mx.float16)
 
-    def mlx_sync(x: object | None) -> None:
-        if x is not None:
-            mx.eval(x)
+    def mlx_op(x: object, y: object) -> object:
+        out = x @ y
+        # MLX is lazy; force compute in the timed loop.
+        mx.eval(out)
+        return out
 
-    return benchmark_seconds(lambda x, y: x @ y, a, b, warmup=warmup, iters=iters, synchronize=mlx_sync)
+    def mlx_sync(_: object | None) -> None:
+        mx.synchronize()
+
+    return benchmark_seconds(mlx_op, a, b, warmup=warmup, iters=iters, synchronize=mlx_sync)
 
 
 def _bench_jax_matmul(*, M: int, N: int, K: int, warmup: int, iters: int, seed: int) -> float:

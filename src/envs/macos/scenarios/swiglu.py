@@ -39,11 +39,13 @@ def _bench_mlx_swiglu(*, rows: int, hidden: int, warmup: int, iters: int, seed: 
 
     def mlx_op(t: object) -> object:
         a, b = mx.split(t, 2, axis=-1)
-        return (a * mx.sigmoid(a)) * b
+        out = (a * mx.sigmoid(a)) * b
+        # MLX is lazy; force compute in the timed loop.
+        mx.eval(out)
+        return out
 
-    def mlx_sync(x: object | None) -> None:
-        if x is not None:
-            mx.eval(x)
+    def mlx_sync(_: object | None) -> None:
+        mx.synchronize()
 
     return benchmark_seconds(mlx_op, x, warmup=warmup, iters=iters, synchronize=mlx_sync)
 
