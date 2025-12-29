@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from src.bench_utils import benchmark_seconds, format_ms
+from src.envs.macos.correctness import check_outputs
 
 
 @dataclass(frozen=True)
@@ -15,27 +18,32 @@ class Case:
     hidden: int
 
 
-def _bench_torch_swiglu(*, rows: int, hidden: int, warmup: int, iters: int) -> float:
-    import torch
+DEFAULT_RTOL = 1e-2
+DEFAULT_ATOL = 5e-2
 
-    device = torch.device("mps")
-    x = torch.randn((rows, 2 * hidden), device=device, dtype=torch.float16).contiguous()
 
+def swiglu_ref(x: torch.Tensor) -> torch.Tensor:
+    """Reference SwiGLU in FP32 on CPU."""
+    a, b = x.chunk(2, dim=-1)
+    y = torch.nn.functional.silu(a.to(torch.float32)) * b.to(torch.float32)
+    return y.to(x.dtype)
+
+
+def _bench_torch_swiglu(*, x: torch.Tensor, warmup: int, iters: int) -> float:
     def torch_op(t: object) -> object:
         a, b = t.chunk(2, dim=-1)
         return torch.nn.functional.silu(a) * b
 
+    torch_compiled = torch.compile(torch_op)
+
     def torch_sync(_: object | None) -> None:
         torch.mps.synchronize()
 
-    return benchmark_seconds(torch_op, x, warmup=warmup, iters=iters, synchronize=torch_sync)
+    return benchmark_seconds(torch_compiled, x, warmup=warmup, iters=iters, synchronize=torch_sync)
 
 
-def _bench_mlx_swiglu(*, rows: int, hidden: int, warmup: int, iters: int, seed: int) -> float:
+def _bench_mlx_swiglu(*, x: object, warmup: int, iters: int) -> float:
     import mlx.core as mx
-
-    mx.random.seed(seed)
-    x = mx.random.normal((rows, 2 * hidden)).astype(mx.float16)
 
     def mlx_op(t: object) -> object:
         a, b = mx.split(t, 2, axis=-1)
@@ -50,15 +58,9 @@ def _bench_mlx_swiglu(*, rows: int, hidden: int, warmup: int, iters: int, seed: 
     return benchmark_seconds(mlx_op, x, warmup=warmup, iters=iters, synchronize=mlx_sync)
 
 
-def _bench_jax_swiglu(*, rows: int, hidden: int, warmup: int, iters: int, seed: int) -> float:
+def _bench_jax_swiglu(*, x: object, warmup: int, iters: int) -> float:
     import jax
     import jax.numpy as jnp
-
-    metal_devices = [d for d in jax.devices() if d.platform.lower() == "metal"]
-    device = metal_devices[0]
-
-    key = jax.random.PRNGKey(seed)
-    x = jax.device_put(jax.random.normal(key, (rows, 2 * hidden), dtype=jnp.float16), device)
 
     def jax_op(t: object) -> object:
         a, b = jnp.split(t, 2, axis=-1)
@@ -76,19 +78,66 @@ def _bench_jax_swiglu(*, rows: int, hidden: int, warmup: int, iters: int, seed: 
 def _run_case(case: Case, *, warmup: int, iters: int, backends: set[str], seed: int) -> None:
     rows, hidden = case.rows, case.hidden
 
-    torch_sec = (
-        _bench_torch_swiglu(rows=rows, hidden=hidden, warmup=warmup, iters=iters) if "torch" in backends else None
-    )
-    mlx_sec = (
-        _bench_mlx_swiglu(rows=rows, hidden=hidden, warmup=warmup, iters=iters, seed=seed)
-        if "mlx" in backends
-        else None
-    )
-    jax_sec = (
-        _bench_jax_swiglu(rows=rows, hidden=hidden, warmup=warmup, iters=iters, seed=seed)
-        if "jax" in backends
-        else None
-    )
+    torch.manual_seed(seed)
+    x_cpu = torch.randn((rows, 2 * hidden), dtype=torch.float16)
+    x_np = x_cpu.numpy()
+
+    ref = swiglu_ref(x_cpu)
+
+    torch_input = None
+    mlx_input = None
+    jax_input = None
+
+    if "torch" in backends:
+        device = torch.device("mps")
+        torch_input = x_cpu.to(device)
+
+    if "mlx" in backends:
+        import mlx.core as mx
+
+        mlx_input = mx.array(x_np)
+
+    if "jax" in backends:
+        import jax
+        import jax.numpy as jnp
+
+        metal_devices = [d for d in jax.devices() if d.platform.lower() == "metal"]
+        device = metal_devices[0]
+        jax_input = jax.device_put(jnp.array(x_np), device)
+
+    with torch.no_grad():
+        outputs: dict[str, object] = {}
+        if torch_input is not None:
+            a, b = torch_input.chunk(2, dim=-1)
+            outputs["torch"] = torch.nn.functional.silu(a) * b
+        if mlx_input is not None:
+            import mlx.core as mx
+
+            a, b = mx.split(mlx_input, 2, axis=-1)
+            out = (a * mx.sigmoid(a)) * b
+            mx.eval(out)
+            outputs["mlx"] = out
+        if jax_input is not None:
+            import jax
+            import jax.numpy as jnp
+
+            a, b = jnp.split(jax_input, 2, axis=-1)
+            out = jax.nn.silu(a) * b
+            out.block_until_ready()
+            outputs["jax"] = out
+
+        check_outputs(
+            ref=ref,
+            outputs=outputs,
+            rtol=DEFAULT_RTOL,
+            atol=DEFAULT_ATOL,
+            seed=seed,
+            context=f"rows={rows} hidden={hidden}",
+        )
+
+    torch_sec = _bench_torch_swiglu(x=torch_input, warmup=warmup, iters=iters) if torch_input is not None else None
+    mlx_sec = _bench_mlx_swiglu(x=mlx_input, warmup=warmup, iters=iters) if mlx_input is not None else None
+    jax_sec = _bench_jax_swiglu(x=jax_input, warmup=warmup, iters=iters) if jax_input is not None else None
 
     def ms(sec: float | None) -> float | None:
         return None if sec is None else format_ms(sec)

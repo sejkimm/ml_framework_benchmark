@@ -113,6 +113,7 @@ def print_notes() -> None:
     """Print benchmark notes."""
     print("Notes:")
     print(" - The first run includes compile/JIT cost, so warmup is required.")
+    print(" - Torch runs under torch.compile for macOS timing.")
     print(" - Some frameworks enqueue work asynchronously; timings include a sync after each timed loop.")
     print(" - MLX is lazy; benchmarks force mx.eval per iteration and sync at the end to avoid dispatch-only timing.")
     print(" - Sanity check: compare implied TFLOPs; unrealistic values usually mean timing is wrong.")

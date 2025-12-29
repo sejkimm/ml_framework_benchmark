@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from src.bench_utils import benchmark_seconds, format_ms
+from src.envs.macos.correctness import check_outputs
 
 DEFAULT_EPS = 1e-6
+DEFAULT_RTOL = 1e-2
+DEFAULT_ATOL = 5e-2
 
 
 @dataclass(frozen=True)
@@ -17,32 +22,37 @@ class Case:
     hidden: int
 
 
-def _bench_torch_residual_rmsnorm(*, rows: int, hidden: int, warmup: int, iters: int) -> float:
-    import torch
+def residual_rmsnorm_ref(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Reference residual + RMSNorm in FP32 on CPU."""
+    z = (x + residual).to(torch.float32)
+    inv_rms = torch.rsqrt((z * z).mean(dim=-1, keepdim=True) + DEFAULT_EPS)
+    y = (z * inv_rms) * weight.to(torch.float32)
+    return y.to(x.dtype)
 
-    device = torch.device("mps")
-    x = torch.randn((rows, hidden), device=device, dtype=torch.float16).contiguous()
-    residual = torch.randn((rows, hidden), device=device, dtype=torch.float16).contiguous()
-    weight = torch.randn((hidden,), device=device, dtype=torch.float16).contiguous()
 
+def _bench_torch_residual_rmsnorm(
+    *,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    warmup: int,
+    iters: int,
+) -> float:
     def torch_op(a: object, b: object, w: object) -> object:
         z = a + b
         inv_rms = torch.rsqrt((z * z).mean(dim=-1, keepdim=True) + DEFAULT_EPS)
         return (z * inv_rms) * w
 
+    torch_compiled = torch.compile(torch_op)
+
     def torch_sync(_: object | None) -> None:
         torch.mps.synchronize()
 
-    return benchmark_seconds(torch_op, x, residual, weight, warmup=warmup, iters=iters, synchronize=torch_sync)
+    return benchmark_seconds(torch_compiled, x, residual, weight, warmup=warmup, iters=iters, synchronize=torch_sync)
 
 
-def _bench_mlx_residual_rmsnorm(*, rows: int, hidden: int, warmup: int, iters: int, seed: int) -> float:
+def _bench_mlx_residual_rmsnorm(*, x: object, residual: object, weight: object, warmup: int, iters: int) -> float:
     import mlx.core as mx
-
-    mx.random.seed(seed)
-    x = mx.random.normal((rows, hidden)).astype(mx.float16)
-    residual = mx.random.normal((rows, hidden)).astype(mx.float16)
-    weight = mx.random.normal((hidden,)).astype(mx.float16)
 
     def mlx_op(a: object, b: object, w: object) -> object:
         z = a + b
@@ -58,18 +68,9 @@ def _bench_mlx_residual_rmsnorm(*, rows: int, hidden: int, warmup: int, iters: i
     return benchmark_seconds(mlx_op, x, residual, weight, warmup=warmup, iters=iters, synchronize=mlx_sync)
 
 
-def _bench_jax_residual_rmsnorm(*, rows: int, hidden: int, warmup: int, iters: int, seed: int) -> float:
+def _bench_jax_residual_rmsnorm(*, x: object, residual: object, weight: object, warmup: int, iters: int) -> float:
     import jax
     import jax.numpy as jnp
-
-    metal_devices = [d for d in jax.devices() if d.platform.lower() == "metal"]
-    device = metal_devices[0]
-
-    key = jax.random.PRNGKey(seed)
-    k1, k2, k3 = jax.random.split(key, 3)
-    x = jax.device_put(jax.random.normal(k1, (rows, hidden), dtype=jnp.float16), device)
-    residual = jax.device_put(jax.random.normal(k2, (rows, hidden), dtype=jnp.float16), device)
-    weight = jax.device_put(jax.random.normal(k3, (hidden,), dtype=jnp.float16), device)
 
     def jax_op(a: object, b: object, w: object) -> object:
         z = a + b
@@ -88,19 +89,95 @@ def _bench_jax_residual_rmsnorm(*, rows: int, hidden: int, warmup: int, iters: i
 def _run_case(case: Case, *, warmup: int, iters: int, backends: set[str], seed: int) -> None:
     rows, hidden = case.rows, case.hidden
 
+    torch.manual_seed(seed)
+    x_cpu = torch.randn((rows, hidden), dtype=torch.float16)
+    residual_cpu = torch.randn((rows, hidden), dtype=torch.float16)
+    weight_cpu = torch.randn((hidden,), dtype=torch.float16)
+    x_np = x_cpu.numpy()
+    residual_np = residual_cpu.numpy()
+    weight_np = weight_cpu.numpy()
+
+    ref = residual_rmsnorm_ref(x_cpu, residual_cpu, weight_cpu)
+
+    torch_inputs = None
+    mlx_inputs = None
+    jax_inputs = None
+
+    if "torch" in backends:
+        device = torch.device("mps")
+        torch_inputs = (x_cpu.to(device), residual_cpu.to(device), weight_cpu.to(device))
+
+    if "mlx" in backends:
+        import mlx.core as mx
+
+        mlx_inputs = (mx.array(x_np), mx.array(residual_np), mx.array(weight_np))
+
+    if "jax" in backends:
+        import jax
+        import jax.numpy as jnp
+
+        metal_devices = [d for d in jax.devices() if d.platform.lower() == "metal"]
+        device = metal_devices[0]
+        jax_inputs = (
+            jax.device_put(jnp.array(x_np), device),
+            jax.device_put(jnp.array(residual_np), device),
+            jax.device_put(jnp.array(weight_np), device),
+        )
+
+    with torch.no_grad():
+        outputs: dict[str, object] = {}
+        if torch_inputs is not None:
+            x_t, r_t, w_t = torch_inputs
+            z = x_t + r_t
+            inv_rms = torch.rsqrt((z * z).mean(dim=-1, keepdim=True) + DEFAULT_EPS)
+            outputs["torch"] = (z * inv_rms) * w_t
+        if mlx_inputs is not None:
+            import mlx.core as mx
+
+            x_m, r_m, w_m = mlx_inputs
+            z = x_m + r_m
+            inv_rms = mx.rsqrt(mx.mean(z * z, axis=-1, keepdims=True) + DEFAULT_EPS)
+            out = (z * inv_rms) * w_m
+            mx.eval(out)
+            outputs["mlx"] = out
+        if jax_inputs is not None:
+            import jax.numpy as jnp
+
+            x_j, r_j, w_j = jax_inputs
+            z = x_j + r_j
+            inv_rms = jnp.reciprocal(jnp.sqrt(jnp.mean(z * z, axis=-1, keepdims=True) + DEFAULT_EPS))
+            out = (z * inv_rms) * w_j
+            out.block_until_ready()
+            outputs["jax"] = out
+
+        check_outputs(
+            ref=ref,
+            outputs=outputs,
+            rtol=DEFAULT_RTOL,
+            atol=DEFAULT_ATOL,
+            seed=seed,
+            context=f"rows={rows} hidden={hidden}",
+        )
+
     torch_sec = (
-        _bench_torch_residual_rmsnorm(rows=rows, hidden=hidden, warmup=warmup, iters=iters)
-        if "torch" in backends
+        _bench_torch_residual_rmsnorm(
+            x=torch_inputs[0], residual=torch_inputs[1], weight=torch_inputs[2], warmup=warmup, iters=iters
+        )
+        if torch_inputs is not None
         else None
     )
     mlx_sec = (
-        _bench_mlx_residual_rmsnorm(rows=rows, hidden=hidden, warmup=warmup, iters=iters, seed=seed)
-        if "mlx" in backends
+        _bench_mlx_residual_rmsnorm(
+            x=mlx_inputs[0], residual=mlx_inputs[1], weight=mlx_inputs[2], warmup=warmup, iters=iters
+        )
+        if mlx_inputs is not None
         else None
     )
     jax_sec = (
-        _bench_jax_residual_rmsnorm(rows=rows, hidden=hidden, warmup=warmup, iters=iters, seed=seed)
-        if "jax" in backends
+        _bench_jax_residual_rmsnorm(
+            x=jax_inputs[0], residual=jax_inputs[1], weight=jax_inputs[2], warmup=warmup, iters=iters
+        )
+        if jax_inputs is not None
         else None
     )
 
