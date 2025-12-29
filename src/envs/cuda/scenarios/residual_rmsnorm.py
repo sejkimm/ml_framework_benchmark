@@ -1,3 +1,5 @@
+"""Residual + RMSNorm benchmark comparing Torch vs Triton vs CUDA extension."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -22,10 +24,10 @@ DEFAULT_MAX_ABS_TOL = 5e-2
 )
 @triton.jit
 def residual_rmsnorm_kernel(
-    X_ptr,
-    R_ptr,
-    W_ptr,
-    Y_ptr,
+    X_ptr: object,
+    R_ptr: object,
+    W_ptr: object,
+    Y_ptr: object,
     stride_xm: tl.constexpr,
     stride_xn: tl.constexpr,
     stride_rm: tl.constexpr,
@@ -36,7 +38,8 @@ def residual_rmsnorm_kernel(
     N: tl.constexpr,
     EPS: tl.constexpr,
     BLOCK_N: tl.constexpr,
-):
+) -> None:
+    """Triton kernel for fused residual + RMSNorm."""
     row = tl.program_id(0)
 
     sum_sq = tl.zeros((), dtype=tl.float32)
@@ -63,6 +66,7 @@ def residual_rmsnorm_kernel(
 def residual_rmsnorm_triton(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, *, eps: float = DEFAULT_EPS
 ) -> torch.Tensor:
+    """Compute residual + RMSNorm using Triton."""
     if not x.is_cuda:
         raise ValueError("x must be a CUDA tensor.")
     if x.dtype != torch.float16:
@@ -104,6 +108,7 @@ def residual_rmsnorm_triton(
 def residual_rmsnorm_torch(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, *, eps: float = DEFAULT_EPS
 ) -> torch.Tensor:
+    """Compute residual + RMSNorm using Torch."""
     z = x + residual
     inv_rms = torch.rsqrt((z * z).mean(dim=-1, keepdim=True) + eps)
     return (z * inv_rms) * weight
@@ -112,6 +117,7 @@ def residual_rmsnorm_torch(
 def residual_rmsnorm_ref(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, *, eps: float = DEFAULT_EPS
 ) -> torch.Tensor:
+    """Reference residual + RMSNorm in FP32."""
     z = (x + residual).to(torch.float32)
     inv_rms = torch.rsqrt((z * z).mean(dim=-1, keepdim=True) + eps)
     y = (z * inv_rms) * weight.to(torch.float32)
@@ -120,8 +126,28 @@ def residual_rmsnorm_ref(
 
 @dataclass(frozen=True)
 class Case:
+    """Input shapes for residual + RMSNorm."""
+
     rows: int
     hidden: int
+
+
+def _residual_rmsnorm_cuda_ext(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    from src.envs.cuda.ops.residual_rmsnorm_cuda import residual_rmsnorm_cuda
+
+    return residual_rmsnorm_cuda(x, residual, weight, eps=DEFAULT_EPS)
+
+
+def _ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None:
+        return None
+    return numerator / denominator
+
+
+def _ms(sec: float | None) -> float | None:
+    if sec is None:
+        return None
+    return format_ms(sec)
 
 
 def _run_case(case: Case, *, device: torch.device, warmup: int, iters: int, backends: set[str]) -> None:
@@ -130,51 +156,39 @@ def _run_case(case: Case, *, device: torch.device, warmup: int, iters: int, back
     residual = torch.randn((rows, hidden), device=device, dtype=torch.float16).contiguous()
     weight = torch.randn((hidden,), device=device, dtype=torch.float16).contiguous()
 
+    def cuda_sync(_: object | None) -> None:
+        torch.cuda.synchronize()
+
+    backend_fns = {
+        "torch": residual_rmsnorm_torch,
+        "cuda_ext": _residual_rmsnorm_cuda_ext,
+        "triton": residual_rmsnorm_triton,
+    }
+    selected = {name: fn for name, fn in backend_fns.items() if name in backends}
+
     with torch.no_grad():
         ref = residual_rmsnorm_ref(x, residual, weight)
-
-        torch_max_abs = None
-        cuda_max_abs = None
-        triton_max_abs = None
-
-        if "torch" in backends:
-            out = residual_rmsnorm_torch(x, residual, weight)
-            torch_max_abs = (ref - out).abs().max().item()
-        if "cuda_ext" in backends:
-            from src.ops.residual_rmsnorm_cuda import residual_rmsnorm_cuda
-
-            out = residual_rmsnorm_cuda(x, residual, weight, eps=DEFAULT_EPS)
-            cuda_max_abs = (ref - out).abs().max().item()
-        if "triton" in backends:
-            out = residual_rmsnorm_triton(x, residual, weight, eps=DEFAULT_EPS)
-            triton_max_abs = (ref - out).abs().max().item()
-
-        max_abs = max(v for v in [torch_max_abs, cuda_max_abs, triton_max_abs] if v is not None)
+        max_abs = 0.0
+        for fn in selected.values():
+            out = fn(x, residual, weight)
+            max_abs = max(max_abs, (ref - out).abs().max().item())
         if max_abs > DEFAULT_MAX_ABS_TOL:
             print(f"[warn] max_abs_diff={max_abs:.4g} (rows,hidden=({rows},{hidden}))")
 
-    torch_sec = None
-    cuda_sec = None
-    triton_sec = None
+    secs = {
+        name: benchmark_seconds(fn, x, residual, weight, warmup=warmup, iters=iters, synchronize=cuda_sync)
+        for name, fn in selected.items()
+    }
+    torch_sec = secs.get("torch")
+    cuda_sec = secs.get("cuda_ext")
+    triton_sec = secs.get("triton")
 
-    if "torch" in backends:
-        torch_sec = benchmark_seconds(residual_rmsnorm_torch, x, residual, weight, warmup=warmup, iters=iters)
-    if "cuda_ext" in backends:
-        from src.ops.residual_rmsnorm_cuda import residual_rmsnorm_cuda
+    torch_ms = _ms(torch_sec)
+    cuda_ms = _ms(cuda_sec)
+    triton_ms = _ms(triton_sec)
 
-        cuda_sec = benchmark_seconds(residual_rmsnorm_cuda, x, residual, weight, warmup=warmup, iters=iters)
-    if "triton" in backends:
-        triton_sec = benchmark_seconds(residual_rmsnorm_triton, x, residual, weight, warmup=warmup, iters=iters)
-
-    def ms(sec: float | None) -> float | None:
-        return None if sec is None else format_ms(sec)
-
-    torch_ms = ms(torch_sec)
-    cuda_ms = ms(cuda_sec)
-    triton_ms = ms(triton_sec)
-
-    speedup_cuda = None if (torch_sec is None or cuda_sec is None) else (torch_sec / cuda_sec)
-    speedup_triton = None if (torch_sec is None or triton_sec is None) else (torch_sec / triton_sec)
+    speedup_cuda = _ratio(torch_sec, cuda_sec)
+    speedup_triton = _ratio(torch_sec, triton_sec)
 
     def fmt(v: float | None, width: int = 10) -> str:
         return f"{v:{width}.3f}" if v is not None else " " * (width - 2) + "NA"
@@ -189,6 +203,7 @@ def _run_case(case: Case, *, device: torch.device, warmup: int, iters: int, back
 
 
 def run(*, device: torch.device, warmup: int, iters: int, backends: set[str]) -> None:
+    """Run residual + RMSNorm benchmarks."""
     if not {"torch", "cuda_ext", "triton"} & backends:
         raise ValueError("backends must include at least one of: torch, cuda_ext, triton")
 
@@ -200,8 +215,10 @@ def run(*, device: torch.device, warmup: int, iters: int, backends: set[str]) ->
     ]
 
     print("\n== residual + rmsnorm (fp16) ==")
-    print(f"{'rows':>6} {'hid':>6} | {'torch(ms)':>10} | {'cuda(ms)':>10} {'su':>8} | {'triton(ms)':>10} {'su':>8}")
+    print(
+        f"{'rows':>6} {'hid':>6} | {'torch(ms)':>10} | {'cuda(ms)':>10} {'speedup':>8} |"
+        f" {'triton(ms)':>10} {'speedup':>8}"
+    )
     print("-" * 80)
     for case in cases:
         _run_case(case, device=device, warmup=warmup, iters=iters, backends=backends)
-

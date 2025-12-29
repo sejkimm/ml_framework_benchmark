@@ -6,24 +6,57 @@ A benchmarking tool to compare performance of different ML frameworks and kernel
 
 ## Comparison Targets
 
+### CUDA (Linux)
+
 - Torch (cuBLAS)
 - Triton
 - Custom CUDA fused ops
 
-## Operations
+### macOS
 
-- Matrix multiplication (matmul)
-- Residual connection + RMSNorm
-- SwiGLU activation
-
-## Environment
-
-Tested on NVIDIA A6000 with `nvcr.io/nvidia/pytorch:25.11-py3` container
+- MLX
+- PyTorch MPS
+- JAX Metal
 
 ## Usage
 
-Run the benchmark:
+Run CUDA benchmarks (Linux):
 
 ```bash
-python3 main.py
+uv run -m src.envs.cuda.runner
 ```
+
+Run macOS benchmarks:
+
+```bash
+uv run -m src.envs.macos.runner
+```
+
+## Operations
+
+### Matrix multiplication (matmul)
+
+Computes `C = A @ B` where `A[M,K]`, `B[K,N]`, `C[M,N]` are FP16 CUDA tensors.
+
+- `torch`: `a @ b` (cuBLAS/cuBLASLt).
+- `triton`: tiled GEMM kernel with FP32 accumulation, stored as FP16.
+
+### Residual connection + RMSNorm
+
+Computes a fused “residual add + RMSNorm”:
+
+- `z = x + residual`
+- `y = (z * rsqrt(mean(z^2) + eps)) * weight`
+
+### SwiGLU activation
+
+Computes SwiGLU:
+
+- Split `x[..., 2*hid]` into `a, b`
+- `y = silu(a) * b` where `silu(a) = a * sigmoid(a)`
+
+## Benchmark Result
+
+| Date       | Environment                        | Processor        | Doc                                    |
+|------------|------------------------------------|------------------|----------------------------------------|
+| 2025-12-22 | `nvcr.io/nvidia/pytorch:25.11-py3` | NVIDIA RTX A6000 | [Result](result/20251222_RTX_A6000.md) |

@@ -1,3 +1,5 @@
+"""CUDA extension wrapper for fused residual + RMSNorm."""
+
 from __future__ import annotations
 
 from functools import lru_cache
@@ -8,8 +10,9 @@ from torch.utils.cpp_extension import load
 
 
 @lru_cache(maxsize=1)
-def _load_ext():
-    src_root = resources.files("benchmark") / "cuda_ext"
+def _load_ext() -> object:
+    cuda_pkg = __package__.rsplit(".", 1)[0]
+    src_root = resources.files(cuda_pkg) / "cuda_ext"
     with resources.as_file(src_root) as src_dir:
         sources = [
             str(src_dir / "residual_rmsnorm_ext.cpp"),
@@ -28,6 +31,7 @@ def _load_ext():
 def residual_rmsnorm_cuda(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, *, eps: float = 1e-6
 ) -> torch.Tensor:
+    """Compute fused residual add + RMSNorm using a custom CUDA extension."""
     if not x.is_cuda:
         raise ValueError("x must be a CUDA tensor.")
     if x.dtype != torch.float16:

@@ -1,3 +1,5 @@
+"""Matmul benchmark comparing Torch vs Triton on CUDA."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,9 +27,9 @@ DEFAULT_MAX_REL_TOL = 1e-2
 )
 @triton.jit
 def matmul_kernel(
-    A_ptr,
-    B_ptr,
-    C_ptr,
+    A_ptr: object,
+    B_ptr: object,
+    C_ptr: object,
     M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -40,7 +42,8 @@ def matmul_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-):
+) -> None:
+    """Triton matmul kernel with FP32 accumulation."""
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
@@ -66,6 +69,7 @@ def matmul_kernel(
 
 
 def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Compute matmul using Triton."""
     if not a.is_cuda or not b.is_cuda:
         raise ValueError("Inputs must be CUDA tensors.")
     if a.dtype != torch.float16 or b.dtype != torch.float16:
@@ -79,7 +83,7 @@ def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     _, N = b.shape
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
 
-    def grid(meta):
+    def grid(meta: dict[str, int]) -> tuple[int, int]:
         return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
 
     matmul_kernel[grid](
@@ -100,15 +104,19 @@ def triton_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def torch_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Compute matmul using Torch (cuBLAS/cuBLASLt)."""
     return a @ b
 
 
 def gemm_tflops(M: int, N: int, K: int, sec: float) -> float:
+    """Compute TFLOPS for a GEMM given dimensions and runtime in seconds."""
     return (2.0 * M * N * K) / sec / 1e12
 
 
 @dataclass(frozen=True)
 class MatmulCase:
+    """Matmul shapes (M, N, K)."""
+
     M: int
     N: int
     K: int
@@ -119,6 +127,9 @@ def _run_case(case: MatmulCase, *, device: torch.device, warmup: int, iters: int
     a = torch.randn((M, K), device=device, dtype=torch.float16).contiguous()
     b = torch.randn((K, N), device=device, dtype=torch.float16).contiguous()
 
+    def cuda_sync(_: object | None) -> None:
+        torch.cuda.synchronize()
+
     if {"torch", "triton"} <= backends:
         with torch.no_grad():
             ref = torch_matmul(a, b)
@@ -128,18 +139,14 @@ def _run_case(case: MatmulCase, *, device: torch.device, warmup: int, iters: int
             ref_abs_max = ref.abs().max().item()
             max_rel = max_abs / max(ref_abs_max, 1e-6)
             if max_abs > DEFAULT_MAX_ABS_TOL and max_rel > DEFAULT_MAX_REL_TOL:
-                print(
-                    "[warn] "
-                    f"max_abs_diff={max_abs:.4g} max_rel_diff={max_rel:.4g} "
-                    f"(M,N,K=({M},{N},{K}))"
-                )
+                print(f"[warn] max_abs_diff={max_abs:.4g} max_rel_diff={max_rel:.4g} (M,N,K=({M},{N},{K}))")
 
     torch_sec = None
     triton_sec = None
     if "torch" in backends:
-        torch_sec = benchmark_seconds(torch_matmul, a, b, warmup=warmup, iters=iters)
+        torch_sec = benchmark_seconds(torch_matmul, a, b, warmup=warmup, iters=iters, synchronize=cuda_sync)
     if "triton" in backends:
-        triton_sec = benchmark_seconds(triton_matmul, a, b, warmup=warmup, iters=iters)
+        triton_sec = benchmark_seconds(triton_matmul, a, b, warmup=warmup, iters=iters, synchronize=cuda_sync)
 
     torch_ms = None if torch_sec is None else format_ms(torch_sec)
     triton_ms = None if triton_sec is None else format_ms(triton_sec)
@@ -163,6 +170,7 @@ def _run_case(case: MatmulCase, *, device: torch.device, warmup: int, iters: int
 
 
 def run(*, device: torch.device, warmup: int, iters: int, backends: set[str]) -> None:
+    """Run matmul benchmarks."""
     if not {"torch", "triton"} & backends:
         raise ValueError("backends must include at least one of: torch, triton")
 

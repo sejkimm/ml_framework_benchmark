@@ -1,2 +1,1 @@
-"""Benchmarks comparing Torch (cuBLAS) vs Triton vs custom CUDA extensions."""
-
+"""Benchmarks comparing CUDA and macOS ML backends."""
