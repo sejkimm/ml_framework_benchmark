@@ -2,6 +2,13 @@
 
 - Created: 2025.12.22
 
+## Update
+
+| Date       | Description                                                                      |
+|------------|----------------------------------------------------------------------------------|
+| 2025.12.29 | Added MacOS Torch MPS / MLX / JAX Metal Comparison                               |
+| 2025.12.29 | Added correctness checks and torch.compile optimizations for both CUDA and macOS |
+
 A benchmarking tool to compare performance of different ML frameworks and kernels.
 
 ## Comparison Targets
@@ -59,4 +66,3 @@ Computes SwiGLU:
 
 | Date       | Environment                        | Processor        | Doc                                    |
 |------------|------------------------------------|------------------|----------------------------------------|
-| 2025-12-22 | `nvcr.io/nvidia/pytorch:25.11-py3` | NVIDIA RTX A6000 | [Result](result/20251222_RTX_A6000.md) |
