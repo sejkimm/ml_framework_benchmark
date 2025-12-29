@@ -9,8 +9,10 @@ import triton
 import triton.language as tl
 
 from src.bench_utils import benchmark_seconds, format_ms
+from src.envs.cuda.correctness import check_backends
 
-DEFAULT_MAX_ABS_TOL = 5e-2
+DEFAULT_RTOL = 1e-2
+DEFAULT_ATOL = 5e-2
 
 
 @triton.autotune(
@@ -23,8 +25,8 @@ DEFAULT_MAX_ABS_TOL = 5e-2
 )
 @triton.jit
 def swiglu_kernel(
-    X_ptr: object,
-    Y_ptr: object,
+    X_ptr,
+    Y_ptr,
     stride_xm: tl.constexpr,
     stride_xn: tl.constexpr,
     stride_ym: tl.constexpr,
@@ -105,28 +107,39 @@ def _swiglu_cuda_ext(x: torch.Tensor) -> torch.Tensor:
     return swiglu_cuda(x)
 
 
-def _run_case(case: Case, *, device: torch.device, warmup: int, iters: int, backends: set[str]) -> None:
+def _run_case(
+    case: Case,
+    *,
+    device: torch.device,
+    warmup: int,
+    iters: int,
+    backends: set[str],
+    seed: int,
+) -> None:
     rows, hidden = case.rows, case.hidden
     x = torch.randn((rows, 2 * hidden), device=device, dtype=torch.float16).contiguous()
 
     def cuda_sync(_: object | None) -> None:
         torch.cuda.synchronize()
 
-    backend_fns = {
-        "torch": swiglu_torch,
-        "cuda_ext": _swiglu_cuda_ext,
-        "triton": swiglu_triton,
-    }
-    selected = {name: fn for name, fn in backend_fns.items() if name in backends}
+    selected = {}
+    if "torch" in backends:
+        selected["torch"] = torch.compile(swiglu_torch)
+    if "cuda_ext" in backends:
+        selected["cuda_ext"] = _swiglu_cuda_ext
+    if "triton" in backends:
+        selected["triton"] = swiglu_triton
 
     with torch.no_grad():
-        ref = swiglu_ref(x)
-        max_abs = 0.0
-        for fn in selected.values():
-            out = fn(x)
-            max_abs = max(max_abs, (ref - out).abs().max().item())
-        if max_abs > DEFAULT_MAX_ABS_TOL:
-            print(f"[warn] max_abs_diff={max_abs:.4g} (rows,hidden=({rows},{hidden}))")
+        check_backends(
+            ref_fn=swiglu_ref,
+            backends=selected,
+            inputs=(x,),
+            rtol=DEFAULT_RTOL,
+            atol=DEFAULT_ATOL,
+            seed=seed,
+            context=f"rows={rows} hidden={hidden}",
+        )
 
     secs = {
         name: benchmark_seconds(fn, x, warmup=warmup, iters=iters, synchronize=cuda_sync)
@@ -158,7 +171,7 @@ def _run_case(case: Case, *, device: torch.device, warmup: int, iters: int, back
     )
 
 
-def run(*, device: torch.device, warmup: int, iters: int, backends: set[str]) -> None:
+def run(*, device: torch.device, warmup: int, iters: int, backends: set[str], seed: int) -> None:
     """Run SwiGLU benchmarks."""
     if not {"torch", "cuda_ext", "triton"} & backends:
         raise ValueError("backends must include at least one of: torch, cuda_ext, triton")
@@ -176,4 +189,4 @@ def run(*, device: torch.device, warmup: int, iters: int, backends: set[str]) ->
     )
     print("-" * 80)
     for case in cases:
-        _run_case(case, device=device, warmup=warmup, iters=iters, backends=backends)
+        _run_case(case, device=device, warmup=warmup, iters=iters, backends=backends, seed=seed)

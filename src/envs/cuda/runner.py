@@ -74,15 +74,16 @@ def print_system_info(args: argparse.Namespace) -> None:
 def run_scenarios(*, args: argparse.Namespace, device: torch.device, backends: set[str]) -> None:
     """Run all selected scenarios."""
     for name in args.scenarios:
-        SCENARIOS[name](device=device, warmup=args.warmup, iters=args.iters, backends=backends)
+        SCENARIOS[name](device=device, warmup=args.warmup, iters=args.iters, backends=backends, seed=args.seed)
 
 
 def print_notes() -> None:
     """Print benchmark notes."""
     print("Notes:")
-    print(" - Torch uses cuBLAS/cuBLASLt, so pure GEMM is often faster in torch.")
-    print(" - Triton and custom CUDA extensions shine more with kernel fusion.")
-    print(" - The first run includes JIT/compile cost, so warmup is required.")
+    print(" - Torch runs under torch.compile (Inductor) for CUDA timing.")
+    print(" - For these cases, compiled torch is typically fastest; triton/cuda_ext may trail on GEMM-heavy ops.")
+    print(" - Triton and custom CUDA extensions still tend to win when real kernel fusion reduces memory traffic.")
+    print(" - The first run includes compile cost, so warmup is required.")
 
 
 def main(argv: list[str] | None = None) -> None:

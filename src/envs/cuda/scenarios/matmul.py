@@ -9,9 +9,10 @@ import triton
 import triton.language as tl
 
 from src.bench_utils import benchmark_seconds, format_ms
+from src.envs.cuda.correctness import check_backends
 
-DEFAULT_MAX_ABS_TOL = 5e-2
-DEFAULT_MAX_REL_TOL = 1e-2
+DEFAULT_RTOL = 1e-2
+DEFAULT_ATOL = 5e-2
 
 
 @triton.autotune(
@@ -27,9 +28,9 @@ DEFAULT_MAX_REL_TOL = 1e-2
 )
 @triton.jit
 def matmul_kernel(
-    A_ptr: object,
-    B_ptr: object,
-    C_ptr: object,
+    A_ptr,
+    B_ptr,
+    C_ptr,
     M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -122,7 +123,15 @@ class MatmulCase:
     K: int
 
 
-def _run_case(case: MatmulCase, *, device: torch.device, warmup: int, iters: int, backends: set[str]) -> None:
+def _run_case(
+    case: MatmulCase,
+    *,
+    device: torch.device,
+    warmup: int,
+    iters: int,
+    backends: set[str],
+    seed: int,
+) -> None:
     M, N, K = case.M, case.N, case.K
     a = torch.randn((M, K), device=device, dtype=torch.float16).contiguous()
     b = torch.randn((K, N), device=device, dtype=torch.float16).contiguous()
@@ -130,21 +139,30 @@ def _run_case(case: MatmulCase, *, device: torch.device, warmup: int, iters: int
     def cuda_sync(_: object | None) -> None:
         torch.cuda.synchronize()
 
-    if {"torch", "triton"} <= backends:
+    selected = {}
+    torch_fn = None
+    if "torch" in backends:
+        torch_fn = torch.compile(torch_matmul)
+        selected["torch"] = torch_fn
+    if "triton" in backends:
+        selected["triton"] = triton_matmul
+
+    if selected:
         with torch.no_grad():
-            ref = torch_matmul(a, b)
-            out = triton_matmul(a, b)
-            diff = (ref - out).abs()
-            max_abs = diff.max().item()
-            ref_abs_max = ref.abs().max().item()
-            max_rel = max_abs / max(ref_abs_max, 1e-6)
-            if max_abs > DEFAULT_MAX_ABS_TOL and max_rel > DEFAULT_MAX_REL_TOL:
-                print(f"[warn] max_abs_diff={max_abs:.4g} max_rel_diff={max_rel:.4g} (M,N,K=({M},{N},{K}))")
+            check_backends(
+                ref_fn=torch_matmul,
+                backends=selected,
+                inputs=(a, b),
+                rtol=DEFAULT_RTOL,
+                atol=DEFAULT_ATOL,
+                seed=seed,
+                context=f"M={M} N={N} K={K}",
+            )
 
     torch_sec = None
     triton_sec = None
-    if "torch" in backends:
-        torch_sec = benchmark_seconds(torch_matmul, a, b, warmup=warmup, iters=iters, synchronize=cuda_sync)
+    if torch_fn is not None:
+        torch_sec = benchmark_seconds(torch_fn, a, b, warmup=warmup, iters=iters, synchronize=cuda_sync)
     if "triton" in backends:
         triton_sec = benchmark_seconds(triton_matmul, a, b, warmup=warmup, iters=iters, synchronize=cuda_sync)
 
@@ -169,7 +187,7 @@ def _run_case(case: MatmulCase, *, device: torch.device, warmup: int, iters: int
     )
 
 
-def run(*, device: torch.device, warmup: int, iters: int, backends: set[str]) -> None:
+def run(*, device: torch.device, warmup: int, iters: int, backends: set[str], seed: int) -> None:
     """Run matmul benchmarks."""
     if not {"torch", "triton"} & backends:
         raise ValueError("backends must include at least one of: torch, triton")
@@ -191,4 +209,4 @@ def run(*, device: torch.device, warmup: int, iters: int, backends: set[str]) ->
     )
     print("-" * 80)
     for case in cases:
-        _run_case(case, device=device, warmup=warmup, iters=iters, backends=backends)
+        _run_case(case, device=device, warmup=warmup, iters=iters, backends=backends, seed=seed)
