@@ -10,6 +10,7 @@ import triton.language as tl
 
 from src.bench_utils import benchmark_seconds, format_ms
 from src.envs.cuda.correctness import check_backends
+from src.envs.cuda.trace import NvtxTracer
 
 DEFAULT_RTOL = 1e-2
 DEFAULT_ATOL = 5e-2
@@ -131,6 +132,7 @@ def _run_case(
     iters: int,
     backends: set[str],
     seed: int,
+    trace: NvtxTracer,
 ) -> None:
     M, N, K = case.M, case.N, case.K
     a = torch.randn((M, K), device=device, dtype=torch.float16).contiguous()
@@ -147,24 +149,28 @@ def _run_case(
     if "triton" in backends:
         selected["triton"] = triton_matmul
 
+    case_label = f"M={M} N={N} K={K}"
     if selected:
-        with torch.no_grad():
-            check_backends(
-                ref_fn=torch_matmul,
-                backends=selected,
-                inputs=(a, b),
-                rtol=DEFAULT_RTOL,
-                atol=DEFAULT_ATOL,
-                seed=seed,
-                context=f"M={M} N={N} K={K}",
-            )
+        with trace.range(f"correctness {case_label}"):
+            with torch.no_grad():
+                check_backends(
+                    ref_fn=torch_matmul,
+                    backends=selected,
+                    inputs=(a, b),
+                    rtol=DEFAULT_RTOL,
+                    atol=DEFAULT_ATOL,
+                    seed=seed,
+                    context=case_label,
+                )
 
     torch_sec = None
     triton_sec = None
     if torch_fn is not None:
-        torch_sec = benchmark_seconds(torch_fn, a, b, warmup=warmup, iters=iters, synchronize=cuda_sync)
+        with trace.range(f"bench torch {case_label}"):
+            torch_sec = benchmark_seconds(torch_fn, a, b, warmup=warmup, iters=iters, synchronize=cuda_sync)
     if "triton" in backends:
-        triton_sec = benchmark_seconds(triton_matmul, a, b, warmup=warmup, iters=iters, synchronize=cuda_sync)
+        with trace.range(f"bench triton {case_label}"):
+            triton_sec = benchmark_seconds(triton_matmul, a, b, warmup=warmup, iters=iters, synchronize=cuda_sync)
 
     torch_ms = None if torch_sec is None else format_ms(torch_sec)
     triton_ms = None if triton_sec is None else format_ms(triton_sec)
@@ -187,7 +193,15 @@ def _run_case(
     )
 
 
-def run(*, device: torch.device, warmup: int, iters: int, backends: set[str], seed: int) -> None:
+def run(
+    *,
+    device: torch.device,
+    warmup: int,
+    iters: int,
+    backends: set[str],
+    seed: int,
+    trace: NvtxTracer,
+) -> None:
     """Run matmul benchmarks."""
     if not {"torch", "triton"} & backends:
         raise ValueError("backends must include at least one of: torch, triton")
@@ -208,5 +222,6 @@ def run(*, device: torch.device, warmup: int, iters: int, backends: set[str], se
         f"{'triton(ms)':>10} {'triton(TFLOPS)':>14} | {'speedup':>8}"
     )
     print("-" * 80)
-    for case in cases:
-        _run_case(case, device=device, warmup=warmup, iters=iters, backends=backends, seed=seed)
+    with trace.range("scenario:matmul"):
+        for case in cases:
+            _run_case(case, device=device, warmup=warmup, iters=iters, backends=backends, seed=seed, trace=trace)

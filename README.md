@@ -8,6 +8,7 @@
 |------------|----------------------------------------------------------------------------------|
 | 2025.12.29 | Added MacOS Torch MPS / MLX / JAX Metal Comparison                               |
 | 2025.12.29 | Added correctness checks and torch.compile optimizations for both CUDA and macOS |
+| 2025.12.30 | Added CUDA NVIDIA Nsight Systems tracing                                         |
 
 A benchmarking tool to compare performance of different ML frameworks and kernels.
 
@@ -31,6 +32,12 @@ Run CUDA benchmarks (Linux):
 
 ```bash
 uv run -m src.envs.cuda.runner
+```
+
+Nsight Systems tracing (Linux/CUDA):
+
+```bash
+nsys profile --trace=cuda,nvtx --sample=none -o result/cuda_bench -- uv run -m src.envs.cuda.runner --nsys
 ```
 
 Run macOS benchmarks:

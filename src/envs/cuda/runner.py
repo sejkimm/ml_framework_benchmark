@@ -11,6 +11,7 @@ import triton
 try:
     from src.bench_utils import DEFAULT_ITERS, DEFAULT_WARMUP
     from src.envs.cuda.scenarios import SCENARIOS
+    from src.envs.cuda.trace import NvtxTracer, build_tracer
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("Run as a module from the repo root:\n  uv run -m src.envs.cuda.runner --help") from exc
 
@@ -38,6 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--iters", type=int, default=DEFAULT_ITERS)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--nsys",
+        action="store_true",
+        help="Emit NVTX ranges for Nsight Systems tracing.",
+    )
     return parser
 
 
@@ -71,19 +77,27 @@ def print_system_info(args: argparse.Namespace) -> None:
     print(f"bench: warmup={args.warmup}, iters={args.iters}, backends={','.join(args.backends)}")
 
 
-def run_scenarios(*, args: argparse.Namespace, device: torch.device, backends: set[str]) -> None:
+def run_scenarios(
+    *,
+    args: argparse.Namespace,
+    device: torch.device,
+    backends: set[str],
+    trace: NvtxTracer,
+) -> None:
     """Run all selected scenarios."""
     for name in args.scenarios:
-        SCENARIOS[name](device=device, warmup=args.warmup, iters=args.iters, backends=backends, seed=args.seed)
+        SCENARIOS[name](device=device, warmup=args.warmup, iters=args.iters, backends=backends, seed=args.seed, trace=trace)
 
 
-def print_notes() -> None:
+def print_notes(*, nsys_enabled: bool) -> None:
     """Print benchmark notes."""
     print("Notes:")
     print(" - Torch runs under torch.compile (Inductor) for CUDA timing.")
     print(" - For these cases, compiled torch is typically fastest; triton/cuda_ext may trail on GEMM-heavy ops.")
     print(" - Triton and custom CUDA extensions still tend to win when real kernel fusion reduces memory traffic.")
     print(" - The first run includes compile cost, so warmup is required.")
+    if nsys_enabled:
+        print(" - NVTX ranges enabled for Nsight Systems (use nsys profile --trace=cuda,nvtx).")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -92,16 +106,17 @@ def main(argv: list[str] | None = None) -> None:
 
     ensure_cuda()
     configure_torch(args.seed)
+    trace = build_tracer(args.nsys)
 
     device = torch.device("cuda")
     print_system_info(args)
     print(DIVIDER)
 
     backends = set(args.backends)
-    run_scenarios(args=args, device=device, backends=backends)
+    run_scenarios(args=args, device=device, backends=backends, trace=trace)
 
     print(DIVIDER)
-    print_notes()
+    print_notes(nsys_enabled=args.nsys)
 
 
 if __name__ == "__main__":

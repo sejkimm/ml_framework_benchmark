@@ -10,6 +10,7 @@ import triton.language as tl
 
 from src.bench_utils import benchmark_seconds, format_ms
 from src.envs.cuda.correctness import check_backends
+from src.envs.cuda.trace import NvtxTracer
 
 DEFAULT_EPS = 1e-6
 DEFAULT_RTOL = 1e-2
@@ -160,6 +161,7 @@ def _run_case(
     iters: int,
     backends: set[str],
     seed: int,
+    trace: NvtxTracer,
 ) -> None:
     rows, hidden = case.rows, case.hidden
     x = torch.randn((rows, hidden), device=device, dtype=torch.float16).contiguous()
@@ -177,21 +179,31 @@ def _run_case(
     if "triton" in backends:
         selected["triton"] = residual_rmsnorm_triton
 
-    with torch.no_grad():
-        check_backends(
-            ref_fn=residual_rmsnorm_ref,
-            backends=selected,
-            inputs=(x, residual, weight),
-            rtol=DEFAULT_RTOL,
-            atol=DEFAULT_ATOL,
-            seed=seed,
-            context=f"rows={rows} hidden={hidden}",
-        )
+    case_label = f"rows={rows} hidden={hidden}"
+    with trace.range(f"correctness {case_label}"):
+        with torch.no_grad():
+            check_backends(
+                ref_fn=residual_rmsnorm_ref,
+                backends=selected,
+                inputs=(x, residual, weight),
+                rtol=DEFAULT_RTOL,
+                atol=DEFAULT_ATOL,
+                seed=seed,
+                context=case_label,
+            )
 
-    secs = {
-        name: benchmark_seconds(fn, x, residual, weight, warmup=warmup, iters=iters, synchronize=cuda_sync)
-        for name, fn in selected.items()
-    }
+    secs: dict[str, float] = {}
+    for name, fn in selected.items():
+        with trace.range(f"bench {name} {case_label}"):
+            secs[name] = benchmark_seconds(
+                fn,
+                x,
+                residual,
+                weight,
+                warmup=warmup,
+                iters=iters,
+                synchronize=cuda_sync,
+            )
     torch_sec = secs.get("torch")
     cuda_sec = secs.get("cuda_ext")
     triton_sec = secs.get("triton")
@@ -215,7 +227,15 @@ def _run_case(
     )
 
 
-def run(*, device: torch.device, warmup: int, iters: int, backends: set[str], seed: int) -> None:
+def run(
+    *,
+    device: torch.device,
+    warmup: int,
+    iters: int,
+    backends: set[str],
+    seed: int,
+    trace: NvtxTracer,
+) -> None:
     """Run residual + RMSNorm benchmarks."""
     if not {"torch", "cuda_ext", "triton"} & backends:
         raise ValueError("backends must include at least one of: torch, cuda_ext, triton")
@@ -233,5 +253,6 @@ def run(*, device: torch.device, warmup: int, iters: int, backends: set[str], se
         f" {'triton(ms)':>10} {'speedup':>8}"
     )
     print("-" * 80)
-    for case in cases:
-        _run_case(case, device=device, warmup=warmup, iters=iters, backends=backends, seed=seed)
+    with trace.range("scenario:residual_rmsnorm"):
+        for case in cases:
+            _run_case(case, device=device, warmup=warmup, iters=iters, backends=backends, seed=seed, trace=trace)
